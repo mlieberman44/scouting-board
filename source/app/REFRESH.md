@@ -1,0 +1,35 @@
+# Scouting Board live refresh runbook
+
+The Scouting Board artifact (https://claude.ai/artifact/7gXi6SuTMUZRFaNBKWwuXo) is a static page with the league data baked in.
+A scheduled routine re-pulls ESPN and republishes it. Steps:
+
+1. **Rosters, injuries, stats.** Back up first: `cp rosters_raw.txt rosters_raw.prev.txt` (in /mnt/project-files/league/data).
+   For each team id in 1 2 3 4 5 6 7 9 11 12, WebFetch
+   `https://lm-api-reads.fantasy.espn.com/apis/v3/games/fba/seasons/2027/segments/0/leagues/99907173?view=mRoster&forTeamId=<id>`
+   with this prompt (curl is blocked by the proxy; WebFetch only):
+   > This is JSON. For each entry in teams[0].roster.entries output ONE line, copying numbers exactly (no estimating):
+   > name | proTeamId | defaultPositionId | eligibleSlots (JSON array) | lineupSlotId | injuryStatus (from playerPoolEntry.player.injuryStatus; the entry-level injuryStatus always reads NORMAL) | ownership.percentOwned | P:<stats object whose id is "102027", its 'stats' map restricted to keys 0,1,2,3,6,11,13,14,15,16,17,18,42, as compact JSON, or none> | C:<same for id "002027", or none> | R:<same for id "022027" (last 15 days), or none> | L:<same for id "002026", or none> | ID:<playerPoolEntry.id>
+   Write all teams to `/mnt/project-files/league/data/rosters_raw.txt`, each block headed `#T <id>`.
+   Sanity-check: ~13 players per team (ESPN cuts each page off after about 13 entries, fewer once games add stats; see 1b. WebFetch's offset option can't reach past it, because the page arrives already cut short); a line whose L:, C: or R: equals another player's exactly is a summarizer copy, so re-fetch that team.
+   For any player whose line is unreadable or looks invented, copy that player's line from rosters_raw.prev.txt (keep today's injury status and slot).
+   Known trouble spots: Darius Acuff Jr. (team 11, often cut off), centers whose projection omits 3PM/3PA keys 17 and 18 (Poeltl, Duren, Zubac, Mitchell Robinson, Gobert: keep prev's zeros), RJ Barrett's NBA team (28 = TOR), Kevin Porter Jr. (team 12's last visible entry, cut off before his NBA team and ownership: keep NBA team 15 = MIL, confirmed on ESPN's athlete page Oct 3), Jeremiah Fears' projection.
+1b. **Players past the cut-off.** Later picks and pickups never reach rosters_raw.txt, so they live in `data/roster_extra.txt`. Edit it only through `python3 /mnt/project-files/league/data/extra.py` (`help` lists the commands, `list` shows who is there, and it checks every stat line it is given).
+   - Find every EXECUTED add, drop and trade since the last pull in the league activity feed, WebFetch `...leagues/99907173?view=kona_league_communication` (newest first, so its visible part covers recent moves). Cross-check `...leagues/99907173?view=mTransactions2`, which also shows waiver claims but arrives cut off and out of date order (that is how team 11's Sep 29 pickup of Neemias Queta was missed until Oct 3). Apply each move. A player who joined a team but isn't in that team's rosters_raw.txt block: `extra.py set`, with their 2025-26 regular-season averages from `https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/<id>/stats` (the totals row if they changed teams). A player who left: `extra.py drop <id>`. A trade: `extra.py move <id> <team>`.
+   - A team showing fewer players than last time has a shorter cut-off, not a drop: only the activity feed and mTransactions2 say who left. Any rostered player missing from both files gets `extra.py set`.
+   - For every player in `extra.py list`, WebFetch `https://site.web.api.espn.com/apis/common/v3/sports/basketball/nba/athletes/<id>` and update injury (`extra.py inj <id> ACTIVE|DAY_TO_DAY|OUT`) and NBA team (`extra.py nba <id> <abbrev, or ? if unsigned>`).
+   - Once games have started, at the 7:52am ET run also update each one's season so far: `extra.py cur <id> "<2026-27 averages>"`.
+2. **Live matchup scores.** WebFetch `...leagues/99907173?view=mMatchupScore&view=mStatus` and write `/mnt/project-files/league/data/live.txt`:
+   ```
+   week:<status.currentMatchupPeriod> day:<status.latestScoringPeriod>
+   <awayTeamId> | <homeTeamId> | <awayCatWins>-<homeCatWins>-<ties> | {"PTS":[a,h],"REB":[a,h],"AST":[a,h],"STL":[a,h],"BLK":[a,h],"TO":[a,h],"FG%":[a,h],"FT%":[a,h],"3P%":[a,h],"FGM":[a,h],"FGA":[a,h],"FTM":[a,h],"FTA":[a,h],"3PM":[a,h],"3PA":[a,h]}
+   ```
+   one line per matchup of that week (values from away/home cumulativeScore.scoreByStat ids 0,6,3,2,1,11,19,20,21,13,14,15,16,17,18; before games start, all 0).
+3. **Standings.** WebFetch `...leagues/99907173?view=mTeam` and write `/mnt/project-files/league/data/records.txt`, one line per team: `<teamId> | <wins>-<losses>-<ties>` from teams[].record.overall (these are category wins in this each-category league).
+4. `python3 /mnt/project-files/league/data/refresh.py` (merges rosters_raw.txt and roster_extra.txt into league_2027.json; keeps FAs, schedule, draft picks; prints injury changes, players per team (15, or 16-17 with IL), moves between teams and anyone who LEFT rosters). Check every move and departure against the activity feed before publishing; a departure with no transaction means a cut-off player is missing from roster_extra.txt.
+5. `python3 /mnt/project-files/league/app/make_page.py` writes `/mnt/project-files/league/app/scouting-board.html` (since v14 it also inlines every module in `app/mods/*.js`, the drill-downs and Stats views; new work happens in `app/dev/` and is copied over only when released, see `app/dev/MODULES.md`) (it also folds in `data/nba_schedule_2027.json`, the NBA game schedule by fantasy day, which only needs re-pulling if the NBA reschedules games or fills in NBA Cup games in December).
+   Since Oct 10 the board has a sign-in page: make_page.py bakes in only sha256 hashes of each team's code from `app/team_codes.json` (private; never copy it or the codes into the site repo or any published file). Managers' personal links are in `/mnt/project-files/league/share/personal_links.md`.
+6. Copy it to a scratchpad path and publish with the Artifact tool with `url` = the artifact link above (read it first if this session hasn't). Do not pass `capabilities` (omitting keeps the page's stored declaration).
+6b. **Own website.** `bash /mnt/project-files/league/app/deploy_site.sh` pushes the same build to GitHub Pages (repo mlieberman44/scouting-board, saved to this project; it needs push access, so if the repo isn't attached to the session, attach it with add_repo first). It prints "pushed <sha>" or "site unchanged". The site is https://mlieberman44.github.io/scouting-board/ (plus Matt's own domain once its CNAME is set).
+7. Post in the thread only if something notable changed for Matt's team (team 1): an injury, a trade/add/drop, or the live week turning. Otherwise update status quietly.
+
+Rest-of-season rankings (FantasyPros) are imported by Matt inside the app (Trades > Value chart > Rest-of-season rankings > Paste rankings) and live in the artifact's database at `shared/ros`; nothing to do here.
